@@ -9,7 +9,7 @@ from tvm import tir
 from tilelang.utils.tensor import map_torch_type
 from tilelang import USE_DISTRIBUTED
 if USE_DISTRIBUTED:
-    import pynvshmem
+    import tilelang.distrbuted as td
 
 cdef class CythonKernelWrapper:
     # Class attributes to store kernel configuration and library reference
@@ -155,7 +155,7 @@ cdef class CythonKernelWrapper:
                         f"Expected shape: {shape}"
                     )
                 if USE_DISTRIBUTED:
-                    tensor = pynvshmem.nvshmem_create_tensor(shape, dtype)
+                    tensor = td.nvshmem_create_tensor(shape, dtype)
                 else:
                     tensor = torch.empty(*shape, dtype=dtype, device=device)
             else:

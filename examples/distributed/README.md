@@ -3,7 +3,7 @@
 This directory contains examples demonstrating distributed computing capabilities using TileLang.
 
 For example, 
-```
+```bash
 ./tilelang/distributed/launch.sh examples/distributed/example_allgather.py
 ```
 
@@ -14,17 +14,13 @@ Before running the examples, you need to build NVSHMEM library for device-side c
 ```bash 
 export NVSHMEM_SRC="your_custom_nvshmem_dir" # default to 3rdparty/nvshmem_src
 cd tilelang/distributed
-source build_nvshmem.sh
-```
-You also need to install the `pynvshmem` package, which provides wrapped host-side Python API for NVSHMEM.
-
-```bash
-cd ./pynvshmem
-python setup.py install
-export LD_LIBRARY_PATH="$NVSHMEM_SRC/build/src/lib:$LD_LIBRARY_PATH"
+bash build_nvshmem.sh
 ```
 
-Then you can test python import:
+You also need to install the `nvshmem4py` package, which provides official Python bindings for host-side NVSHMEM APIs.
+
 ```bash
-python -c "import pynvshmem"
+pip install nvidia-nvshmem-cu12==3.3.9
 ```
+
+> Note: We have recently migrated from `pynvshmem` package to `nvshmem4py` for host-side API. Therefore, the correctness of examples here has not been fully verified yet.

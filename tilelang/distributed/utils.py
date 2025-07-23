@@ -1,23 +1,43 @@
 import torch
-import pynvshmem
 import datetime
 import os
 from typing import List, Union, Tuple, Callable, Sequence
 from contextlib import contextmanager
 from cuda import cuda, cudart
+import nvshmem.core
+from nvshmem.core.nvshmem_types import Stream
 
+# Mapping from str to torch dtype
 dtype_map = {
+    "float32": torch.float32,
     "bfloat16": torch.bfloat16,
     "float16": torch.float16,
     "float8_e4m3fn": torch.float8_e4m3fn,
     "float8_e5m2": torch.float8_e5m2,
     "s8": torch.int8,
     "s32": torch.int32,
-    "float32": torch.float32,
+    "int64": torch.int64,
+    "uint64": torch.uint64
 }
+    
 
+def init_nvshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
+    # Extract rank, nranks from process group
+    num_ranks = pg.size()
+    rank_id = pg.rank()
+
+    # Create an empty uniqueid for all ranks
+    broadcast_objects = [nvshmem.core.get_unique_id(empty=rank_id != 0)]
+    torch.distributed.broadcast_object_list(broadcast_objects, src=0, group=pg)
+    torch.distributed.barrier(group=pg)
+    from cuda.core.experimental import Device
+    nvshmem.core.init(device=Device(torch.cuda.current_device()), uid=broadcast_objects[0], rank=rank_id,
+                      nranks=num_ranks, initializer_method="uid")
+    # nvshmem.core.utils._configure_logging("DEBUG")
+    
 
 def init_distributed(return_tp_group=False):
+    assert not torch.distributed.is_initialized(), "Torch distributed has been initialized."
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
     RANK = int(os.environ.get("RANK", 0))
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
@@ -32,14 +52,20 @@ def init_distributed(return_tp_group=False):
     assert torch.distributed.is_initialized()
     TP_GROUP = torch.distributed.new_group(ranks=list(range(WORLD_SIZE)), backend="nccl")
 
-    torch.cuda.synchronize()
-    pynvshmem.init_nvshmem_by_uniqueid(TP_GROUP)
+    
+    # torch.cuda.synchronize()
+    init_nvshmem_by_torch_process_group(TP_GROUP)
 
     if return_tp_group:
         return WORLD_SIZE, RANK, LOCAL_RANK, TP_GROUP
     else:
         return WORLD_SIZE, RANK, LOCAL_RANK
+    
 
+def finalize_distributed():
+    nvshmem.core.finalize()
+    torch.distributed.destroy_process_group()
+    
 
 @contextmanager
 def with_torch_deterministic(mode: bool, warn_only: bool = True):
@@ -172,3 +198,16 @@ def CUDA_CHECK(err):
             raise RuntimeError(f"Cuda Error: {err}: {cudart.cudaGetErrorString(err)}")
     else:
         raise RuntimeError(f"Unknown error type: {err}")
+
+
+def create_nvshmem_stream(torch_stream: torch.cuda.Stream = None) -> Stream:
+    """Create a new NVSHMEM stream.
+    Args:
+        torch_stream (torch.cuda.Stream): The torch CUDA stream to use. If None, the current stream will be used.
+    Returns:
+        Stream: A new NVSHMEM stream that can be used with NVSHMEM operations.
+    """
+    if torch_stream is None:
+        torch_stream = torch.cuda.current_stream()
+    return Stream.from_handle(torch_stream.cuda_stream)
+    
