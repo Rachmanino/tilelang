@@ -118,6 +118,12 @@ __device__ void debug_print_buffer_value<uint16_t>(const char *msg,
          threadIdx.z, buf_name, index, (uint32_t)var);
 }
 
+TL_DEVICE void debug_print_msg(const char *msg) {
+  printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d)\n",
+         msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+         threadIdx.z);
+}
+
 TL_DEVICE void device_assert(bool cond) { assert(cond); }
 
 TL_DEVICE void device_assert_with_msg(bool cond, const char *msg) {
