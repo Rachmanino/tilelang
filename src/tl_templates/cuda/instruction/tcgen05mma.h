@@ -143,7 +143,7 @@ TL_DEVICE void tcgen05mma_ts<DataType::kFloat8_e5m2>(
 }
 
 // F16/BF16 instruction kind (maps to kind::f16)
-template <>
+template <bool use_2cta=false>
 TL_DEVICE void tcgen05mma_ss<DataType::kFloat16>(
     uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
     uint32_t const &scalec, uint32_t const &desc_val, int const &mask0,
@@ -151,26 +151,40 @@ TL_DEVICE void tcgen05mma_ss<DataType::kFloat16>(
   // idescE upper 32 bits carry the instruction descriptor; lower 32 ignored for
   // SS Load TMEM base from shared memory slot handled by caller
 
-  if (cute::elect_one_sync()) {
-    asm volatile("{\n\t"
-                 ".reg .pred p;\n\t"
-                 "setp.ne.b32 p, %4, 0;\n\t"
-                 "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, "
-                 "%6, %7, %8}, p; \n\t"
-                 "}\n"
-                 :
-                 : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val),
-                   "r"(scalec), "r"(mask0), "r"(mask1), "r"(mask2), "r"(mask3));
+  if constexpr (use_2cta) {
+    if (cute::elect_one_sync()) {
+      asm volatile("{\n\t"
+                   ".reg .pred p;\n\t"
+                   "setp.ne.b32 p, %4, 0;\n\t"
+                   "tcgen05.mma.cta_group::2.kind::f16 [%0], %1, %2, %3, {%5, "
+                   "%6, %7, %8}, p; \n\t"
+                   "}\n"
+                   :
+                   : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val),
+                     "r"(scalec), "r"(mask0), "r"(mask1), "r"(mask2), "r"(mask3));
+    }
+  } else {
+    if (cute::elect_one_sync()) {
+      asm volatile("{\n\t"
+                  ".reg .pred p;\n\t"
+                  "setp.ne.b32 p, %4, 0;\n\t"
+                  "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, {%5, "
+                  "%6, %7, %8}, p; \n\t"
+                  "}\n"
+                  :
+                  : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(desc_val),
+                    "r"(scalec), "r"(mask0), "r"(mask1), "r"(mask2), "r"(mask3));
+    }
   }
 }
 
 // BF16 maps to the same f16-kind instruction
-template <>
+template <bool use_2cta=false>
 TL_DEVICE void tcgen05mma_ss<DataType::kBFloat16>(
     uint64_t const &desc_a, uint64_t const &desc_b, uint32_t const &tmem_c,
     uint32_t const &scalec, uint32_t const &desc_val, int const &mask0,
     int const &mask1, int const &mask2, int const &mask3) {
-  tcgen05mma_ss<DataType::kFloat16>(desc_a, desc_b, tmem_c, scalec, desc_val,
+  tcgen05mma_ss<DataType::kFloat16, use_2cta>(desc_a, desc_b, tmem_c, scalec, desc_val,
                                     mask0, mask1, mask2, mask3);
 }
 

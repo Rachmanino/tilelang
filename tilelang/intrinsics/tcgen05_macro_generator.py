@@ -289,7 +289,10 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
                 int(b_swizzle_mode),
             )
 
-            tmem_col_step = atom_n // (128 // atom_m)
+            if enable_2cta:
+                tmem_col_step = atom_n // (128 // (atom_m // 2))
+            else:
+                tmem_col_step = atom_n // (128 // atom_m)
             for j in T.unroll(num_inst_n):
                 for i in T.unroll(num_inst_m):
                     for ki in T.unroll(0, (k_dim // micro_size_k)):
@@ -331,6 +334,7 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
                             mask2,
                             mask3,
                             enable_ws,
+                            enable_2cta,
                         )
             T.tcgen05_mma_arrive(mbar)
 
@@ -372,7 +376,7 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
             raise ValueError(
                 f"Unsupported TCGEN5MMA configuration: M={m}, N={n}, K={k}, A dtype={self.a_dtype}, accum dtype={self.accum_dtype}"
             )
-        atom_m, atom_n, _, _, _ = (int(x) for x in meta)
+        atom_m, atom_n, _, _, enable_2cta = (int(x) for x in meta)
 
         if m % atom_m != 0 or n % atom_n != 0:
             raise ValueError(f"Invalid TCGEN5MMA store layout for shape ({m}, {n}) with atoms ({atom_m}, {atom_n})")
@@ -382,6 +386,13 @@ class TensorCoreIntrinEmitter(MMAIntrinEmitter):
             ai = i % atom_m
             aj = j % atom_n
 
+            if atom_m == 256:
+                # Layout A (2 cta)
+                assert enable_2cta, "atom_m=256 for TCGEN5MMA must use 2cta"
+                return [
+                    ai % 128
+                    aj + atom_idx * atom_n,
+                ]
             if atom_m == 128:
                 # Layout D
                 return [
