@@ -142,6 +142,14 @@ public:
           auto stmts = prefetch_calls_;
           stmts.insert(stmts.end(), init_mbarrier_calls_.begin(),
                        init_mbarrier_calls_.end());
+          // Add fence_barrier_init inside the if block, after the barrier init
+          // calls. This ensures the fence is only executed by the thread that
+          // initializes the barriers, matching the pattern in DeepGEMM/cutlass
+          if (!init_mbarrier_calls_.empty()) {
+            stmts.push_back(Evaluate(Call(DataType::Handle(),
+                                          tvm::tl::ptx_fence_barrier_init(),
+                                          {})));
+          }
           PrimExpr condition;
           if (!disable_shuffle_elect_) {
             condition = Call(DataType::Bool(), tl_shuffle_elect(), {0});
@@ -159,9 +167,6 @@ public:
             // with an appropriate sync instruction with the right scope to
             // ensure visibility eg. __syncthreads() or a cluster_arrive() +
             // cluster_wait()
-            Stmt mem_fence = Evaluate(Call(
-                DataType::Handle(), tvm::tl::ptx_fence_barrier_init(), {}));
-            stmt_seq.push_back(mem_fence);
             Stmt mem_sync =
                 Evaluate(Call(DataType::Handle(), builtin::tvm_storage_sync(),
                               {StringImm("shared")}));

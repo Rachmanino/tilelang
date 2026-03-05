@@ -137,14 +137,17 @@ private:
     } else {
       condition = EQ(thread_var_->var, 0);
     }
+    // Add fence_barrier_init inside the if block, after the barrier init calls
+    // This ensures the fence is only executed by the thread that initializes
+    // the barriers, matching the pattern in DeepGEMM/cutlass
+    init_mbarrier_calls_.push_back(
+        Evaluate(Call(DataType::Handle(), ptx_fence_barrier_init(), {})));
     new_body.push_back(IfThenElse(condition,
                                   init_mbarrier_calls_.size() == 1
                                       ? init_mbarrier_calls_.back()
                                       : SeqStmt(init_mbarrier_calls_),
                                   Stmt()));
 
-    new_body.push_back(
-        Evaluate(Call(DataType::Handle(), ptx_fence_barrier_init(), {})));
     new_body.push_back(Evaluate(
         Call(DataType::Handle(), builtin::tvm_storage_sync(),
              {StringImm(has_cluster_barrier_ ? "cluster" : "shared")})));
