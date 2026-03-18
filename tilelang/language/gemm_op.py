@@ -224,3 +224,149 @@ def gemm(
     """
     impl = gemm_v1 if _env.use_gemm_v1() else gemm_v2
     return impl(A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack, wg_wait, mbar)
+
+
+def blockscaled_gemm(
+    A: BufferLikeType,
+    B: BufferLikeType,
+    C: BufferLikeType,
+    SFA_tmem: BufferLikeType,
+    SFB_tmem: BufferLikeType,
+    transpose_A: bool = False,
+    transpose_B: bool = False,
+    clear_accum=False,
+    wg_wait: int = 0,
+    mbar: BarrierType | None = None,
+    sf_a_id: int = 0,
+    sf_b_id: int = 0,
+) -> tir.PrimExpr:
+    """Block-scaled GEMM for MXFP8 on SM100 (Blackwell).
+
+    Issues ``tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale`` instructions.
+    A, B are FP8 (E4M3/E5M2) in shared memory, C is accumulator in tensor memory.
+    SFA_tmem, SFB_tmem are E8M0 scale factors already in tensor memory (loaded via UTCCP).
+
+    This function is designed for warp-specialized schedules where one warp issues MMA.
+    Scale factor loading (TMA → smem → transpose → UTCCP → tmem) must be managed by
+    the user schedule (see examples/gemm_sm100/gemm_mxfp8_blockscaled.py).
+
+    Args:
+        A: FP8 input buffer A in shared memory.
+        B: FP8 input buffer B in shared memory.
+        C: FP32 accumulator in tensor memory.
+        SFA_tmem: Scale factors for A in tensor memory.
+        SFB_tmem: Scale factors for B in tensor memory.
+        transpose_A: Whether A is MN-major. Default: False (K-major).
+        transpose_B: Whether B is K-major. Default: False (MN-major).
+        clear_accum: Whether to zero the accumulator.
+        wg_wait: Warp group wait identifier.
+        mbar: Mbarrier for MMA completion signaling.
+        sf_a_id: Scale factor ID for A (0-3).
+        sf_b_id: Scale factor ID for B (0-3).
+    """
+    from tilelang.intrinsics.tcgen05_macro_generator import (
+        TensorCoreIntrinEmitter,
+    )
+    from tilelang.layout import make_full_bank_swizzled_layout
+
+    def legalize(arg):
+        if isinstance(arg, tir.Var) and T.has_let_value(arg):
+            return T.get_let_value(arg).buffer
+        return arg
+
+    A = legalize(A)
+    B = legalize(B)
+    C = legalize(C)
+    SFA_tmem = legalize(SFA_tmem)
+    SFB_tmem = legalize(SFB_tmem)
+    mbar = legalize(mbar) if mbar is not None else None
+
+    A_region = to_buffer_region(A)
+    B_region = to_buffer_region(B)
+    C_region = to_buffer_region(C)
+
+    A_shape = retrieve_shape(A_region)
+    B_shape = retrieve_shape(B_region)
+    C_shape = retrieve_shape(C_region)
+
+    M, N = int(C_shape[0]), int(C_shape[1])
+    K = int(A_shape[-2] if transpose_A else A_shape[-1])
+
+    a_dtype = str(A_region.buffer.dtype)
+    accum_dtype = str(C_region.buffer.dtype)
+
+    # Create intrinsic emitter — for block-scaled, TCGEN5 always uses 1 warp group
+    emitter = TensorCoreIntrinEmitter(
+        a_dtype=a_dtype,
+        b_dtype=a_dtype,
+        accum_dtype=accum_dtype,
+        a_transposed=transpose_A,
+        b_transposed=transpose_B,
+        block_row_warps=1,
+        block_col_warps=1,
+        warp_row_tiles=M,
+        warp_col_tiles=N,
+        chunk=K,
+    )
+
+    # Assign shared layouts (default: full-bank swizzled for FP8)
+    a_buf = A_region.buffer if isinstance(A_region, tir.BufferRegion) else A
+    b_buf = B_region.buffer if isinstance(B_region, tir.BufferRegion) else B
+    emitter._assign_a_shared_layout(make_full_bank_swizzled_layout(a_buf))
+    emitter._assign_b_shared_layout(make_full_bank_swizzled_layout(b_buf))
+
+    # Convert mbar to a pointer, same as the regular gemm tile-op does
+    from tilelang.utils.language import retrieve_ptr as _retrieve_ptr
+    mbarptr = _retrieve_ptr(mbar, "rw") if mbar is not None else None
+    return emitter.tcgen05mma_blockscaled(
+        A, B, C, SFA_tmem, SFB_tmem,
+        mbarptr, clear_accum, sf_a_id, sf_b_id,
+    )
+
+
+def make_blockscaled_gemm_layout(
+    C: BufferLikeType,
+    A: BufferLikeType,
+    transpose_A: bool = False,
+) -> "Layout":
+    """Build the TMEM store layout for the C accumulator of a block-scaled GEMM.
+
+    Users must call ``T.annotate_layout({C_tmem: layout})`` with the returned layout
+    so that subsequent ``T.copy(C_tmem, ...)`` can be lowered correctly.
+
+    Args:
+        C: The TMEM accumulator buffer (block_M, block_N).
+        A: The FP8 operand A buffer (used to infer K and dtype).
+        transpose_A: Whether A is MN-major.
+
+    Returns:
+        A Layout object for C's TMEM storage.
+    """
+    from tilelang.intrinsics.tcgen05_macro_generator import TensorCoreIntrinEmitter
+
+    C_region = to_buffer_region(C)
+    A_region = to_buffer_region(A)
+
+    C_shape = retrieve_shape(C_region)
+    A_shape = retrieve_shape(A_region)
+
+    M, N = int(C_shape[0]), int(C_shape[1])
+    K = int(A_shape[-2] if transpose_A else A_shape[-1])
+    a_dtype = str(A_region.buffer.dtype)
+    accum_dtype = str(C_region.buffer.dtype)
+
+    emitter = TensorCoreIntrinEmitter(
+        a_dtype=a_dtype,
+        b_dtype=a_dtype,
+        accum_dtype=accum_dtype,
+        a_transposed=transpose_A,
+        b_transposed=False,
+        block_row_warps=1,
+        block_col_warps=1,
+        warp_row_tiles=M,
+        warp_col_tiles=N,
+        chunk=K,
+    )
+
+    c_buf = C_region.buffer if isinstance(C_region, tir.BufferRegion) else C
+    return emitter.make_mma_store_layout(c_buf)

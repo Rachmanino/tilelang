@@ -350,6 +350,26 @@ TVM_DLL const Op &ptx_tcgen05_mma_ss();
 TVM_DLL const Op &ptx_tcgen05_mma_ts();
 
 /*!
+ * \brief tvm intrinsic for tcgen05 block-scaled mma shared-shared instructions.
+ */
+TVM_DLL const Op &ptx_tcgen05_mma_blockscaled_ss();
+
+/*!
+ * \brief tvm intrinsic for tcgen05 UTCCP copy (smem to tmem).
+ */
+TVM_DLL const Op &ptx_tcgen05_utccp();
+
+/*!
+ * \brief tvm intrinsic for scale factor warp transpose in shared memory.
+ */
+TVM_DLL const Op &ptx_tcgen05_sf_warp_transpose();
+
+/*!
+ * \brief tvm intrinsic for building scale factor smem descriptor.
+ */
+TVM_DLL const Op &ptx_tcgen05_make_sf_desc();
+
+/*!
  * \brief tvm intrinsics for initializing tensor memory
  *
  * ptx_init_tensor_memory(tmem_buffer, num_cols)
@@ -701,6 +721,22 @@ TVM_DLL const Op &initialize_tcgen05_descriptor();
  *  to a shared-memory mbarrier. It mirrors CUTLASS's umma_arrive.
  */
 TVM_DLL const Op &tcgen05_mma_arrive();
+
+/*!
+ * \brief tilelang intrinsic for before thread sync of TCGEN05.
+ *
+ *  This op is used to represent a before thread sync operation in
+ * tilelang.
+ */
+TVM_DLL const Op &tcgen05_before_thread_sync();
+
+/*!
+ * \brief tilelang intrinsic for after thread sync of TCGEN05.
+ *
+ *  This op is used to represent a after thread sync operation in
+ * tilelang.
+ */
+TVM_DLL const Op &tcgen05_after_thread_sync();
 
 /*!
  * \brief tilelang intrinsic for setting the start address of a descriptor
