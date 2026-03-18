@@ -27,6 +27,7 @@ enum class CopyInst : uint8_t {
   kBulkStore1D = 7, // utilize tma store 1d
   kTMemLoad = 8,    // tcgen05.ld (tensor memory -> register)
   kTMemStore = 9,   // tcgen05.st (register -> tensor memory)
+  kTMemCp = 10,     // tcgen05.cp (shared memory -> tensor memory)
 };
 
 /// Convert CopyInst enum to string for debugging
@@ -52,6 +53,8 @@ inline const char *CopyInstToString(CopyInst inst) {
     return "TMemLoad";
   case CopyInst::kTMemStore:
     return "TMemStore";
+  case CopyInst::kTMemCp:
+    return "TMemCp";
   default:
     return "Unknown";
   }
@@ -252,6 +255,11 @@ public:
    * \brief Check if tensor memory store is supported.
    */
   bool CheckTMemStore(Target target) const;
+
+  /*!
+   * \brief Check if tensor memory cp (shared→tmem) is supported.
+   */
+  bool CheckTMemCp(Target target) const;
 
   /*!
    * \brief Check if cp.async copy is supported.

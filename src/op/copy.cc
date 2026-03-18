@@ -469,9 +469,13 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     }
   }
 
+  // tcgen05.cp (shared→tmem) needs no layout inference — no registers involved.
+  if (copy_inst == CopyInst::kTMemCp) {
+    return {};
+  }
+
   // Handle tensor memory (tmem) layout inference for both load and store
   if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
-    // TODO (mzw) Add support for tcgen05.cp (in conj. with LowerTmemCopy)
     LayoutMap results;
     bool is_tmem_load = (copy_inst == CopyInst::kTMemLoad);
     Buffer tmem_buf = is_tmem_load ? src : dst;
@@ -796,6 +800,11 @@ bool CopyNode::CheckTMemStore(Target target) const {
          dst.scope() == "shared.tmem";
 }
 
+bool CopyNode::CheckTMemCp(Target target) const {
+  return TargetHasTmem(target) && IsSharedBuffer(src) &&
+         dst.scope() == "shared.tmem";
+}
+
 // Checks if copy can use cp.async global->shared path.
 // Requirements:
 // - target has async copy capability
@@ -892,6 +901,8 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
+  } else if (CheckTMemCp(target)) {
+    return CopyInst::kTMemCp;
   } else if (in_pipeline) {
     using namespace tvm::transform;
     PassContext pass_ctx = PassContext::Current();
@@ -918,7 +929,8 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto copy_inst = GetCopyInst(target, disable_tma_lower || GetDisableTMA(),
                                T.layout_map, analyzer, /*buffer_oob=*/false,
                                /*in_pipeline=*/T.in_pipeline);
-  if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
+  if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore ||
+      copy_inst == CopyInst::kTMemCp) {
     auto tmem_copy = LowerTmemCopy(T, analyzer);
     ICHECK(tmem_copy.defined()) << "Failed to lower tensor memory copy";
     return tmem_copy;
@@ -1263,17 +1275,87 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
     is_ld = true;
   } else if (IsFragmentBuffer(src) && dst.scope() == "shared.tmem") {
     is_st = true;
-  } else if (src.scope() == "shared.dyn" && dst.scope() == "shared.tmem") {
+  } else if (IsSharedBuffer(src) && dst.scope() == "shared.tmem") {
     is_cp = true;
   } else {
     LOG(FATAL) << "Unsupported tensor memory copy: "
                << "src scope = " << src.scope()
                << ", dst scope = " << dst.scope();
   }
-  // Currently tcgen05.cp is not supported
-  // TODO (mzw) Support tcgen05.cp
-  ICHECK(!is_cp)
-      << "Copy from shared memory to tensor memory is not supported yet";
+  // tcgen05.cp: shared memory → tensor memory
+  if (is_cp) {
+    // Each tcgen05.cp.cta_group::1.32x128b.warpx4 copies 128 uint32 = 4 TMEM columns.
+    // We emit one call per 128-element chunk, with the first warp in
+    // thread_bounds executing (elect_one_sync inside the C++ template picks
+    // one thread within that warp).
+    constexpr int WARP_SIZE = 32;
+    constexpr int ELEMENTS_PER_CP = 128;
+    constexpr int COLS_PER_CP = 4;
+
+    ICHECK(src->dtype == DataType::UInt(32))
+        << "tcgen05.cp currently requires uint32 source data, got " << src->dtype;
+
+    // Compute total elements from the copy region
+    int64_t total_elements = 1;
+    for (const auto &r : src_range) {
+      auto ext = as_const_int(r->extent);
+      ICHECK(ext) << "tcgen05.cp requires constant source region extents";
+      total_elements *= *ext;
+    }
+    ICHECK(total_elements % ELEMENTS_PER_CP == 0)
+        << "tcgen05.cp requires source element count to be a multiple of "
+        << ELEMENTS_PER_CP << ", got " << total_elements;
+    int num_calls = static_cast<int>(total_elements / ELEMENTS_PER_CP);
+
+    // Compute flat element offset of region start via row-major strides
+    int ndim = static_cast<int>(src->shape.size());
+    PrimExpr flat_offset = make_const(DataType::Int(32), 0);
+    PrimExpr stride = make_const(DataType::Int(32), 1);
+    for (int i = ndim - 1; i >= 0; --i) {
+      flat_offset = flat_offset + src_range[i]->min * stride;
+      stride = stride * src->shape[i];
+    }
+
+    // SMEM base access_ptr
+    PrimExpr ptype = tir::TypeAnnotation(src->dtype);
+    auto make_smem_ptr = [&](PrimExpr elem_offset) {
+      return Call(DataType::Handle(), builtin::tvm_access_ptr(),
+                  {ptype, src->data, elem_offset,
+                   IntImm(DataType::Int(32), ELEMENTS_PER_CP),
+                   IntImm(DataType::Int(32), 1 /*read*/)});
+    };
+
+    // TMEM data pointer
+    PrimExpr tmem_ptr = dst->data;
+
+    // Build a sequence of ptx_tcgen05_cp calls
+    std::vector<Stmt> stmts;
+    for (int i = 0; i < num_calls; ++i) {
+      PrimExpr smem_ptr = make_smem_ptr(flat_offset + i * ELEMENTS_PER_CP);
+      PrimExpr col_offset = IntImm(DataType::Int(32), i * COLS_PER_CP);
+      stmts.push_back(Evaluate(
+          Call(DataType::Void(), ptx_tcgen05_cp(),
+               {smem_ptr, tmem_ptr, col_offset})));
+    }
+
+    Stmt body = stmts[0];
+    for (size_t i = 1; i < stmts.size(); ++i) {
+      body = SeqStmt({body, stmts[i]});
+    }
+
+    // Predicate: only first warp in thread_bounds executes
+    ICHECK(is_const_int(T.thread_bounds->extent))
+        << "tcgen05.cp requires constant thread_bounds extent";
+    int num_threads = *as_const_int(T.thread_bounds->extent);
+    if (num_threads > WARP_SIZE) {
+      body = IfThenElse(
+          FloorDiv(T.thread_var, WARP_SIZE) ==
+              FloorDiv(T.thread_bounds->min, WARP_SIZE),
+          body);
+    }
+    return body;
+  }
+
   // Extract loop variables and ranges
   Array<IterVar> loop_vars = MakeIterVars();
   ICHECK(loop_vars.size() == 2) << "Only support 2D tensor memory copy, got "

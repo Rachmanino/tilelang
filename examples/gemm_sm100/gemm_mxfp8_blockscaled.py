@@ -108,16 +108,13 @@ def mxfp8_blockscaled_gemm(
                 T.mbarrier_wait_parity(loaded[k % num_stages], (k // num_stages) & 1)
 
                 # SF transpose + UTCCP when new SF was loaded
-                # Each call handles 128 uint32 elements = 4 TMEM columns
                 if k % sf_load_period == 0:
                     for ci in range(sfa_num_chunks):
                         T.sf_warp_transpose(SFA_shared[k % num_stages, ci * 128])
                     for ci in range(sfb_num_chunks):
                         T.sf_warp_transpose(SFB_shared[k % num_stages, ci * 128])
-                    for ci in range(sfa_num_chunks):
-                        T.tcgen05_cp(SFA_shared[k % num_stages, ci * 128], SFA_tmem, tmem_col_offset=ci * 4)
-                    for ci in range(sfb_num_chunks):
-                        T.tcgen05_cp(SFB_shared[k % num_stages, ci * 128], SFB_tmem, tmem_col_offset=ci * 4)
+                    T.copy(SFA_shared[k % num_stages, :], SFA_tmem)
+                    T.copy(SFB_shared[k % num_stages, :], SFB_tmem)
 
                 # sf_id selects which of the 4 packed E8M0 values to use
                 T.blockscaled_gemm(
