@@ -1306,8 +1306,8 @@ def ptx_tcgen05_mma_blockscaled_ss(
     )
 
 
-def ptx_tcgen05_utccp(smem_desc, tmem_col, tmem_col_offset=0):
-    """TVM intrinsic for tcgen05 UTCCP copy (shared memory to tensor memory).
+def ptx_tcgen05_cp(smem_desc, tmem_col, tmem_col_offset=0):
+    """TVM intrinsic for tcgen05 copy (shared memory to tensor memory).
 
     Args:
         smem_desc: Shared memory pointer for scale factor data.
@@ -1316,7 +1316,7 @@ def ptx_tcgen05_utccp(smem_desc, tmem_col, tmem_col_offset=0):
     """
     return call_intrin(
         "handle",
-        _tvm_op.Op.get("tl.ptx_tcgen05_utccp"),
+        _tvm_op.Op.get("tl.ptx_tcgen05_cp"),
         smem_desc,
         tmem_col,
         tmem_col_offset,
@@ -1328,16 +1328,6 @@ def ptx_tcgen05_sf_warp_transpose(smem_ptr):
     return call_intrin(
         "handle",
         _tvm_op.Op.get("tl.ptx_tcgen05_sf_warp_transpose"),
-        smem_ptr,
-    )
-
-
-def ptx_tcgen05_make_sf_desc(desc_var, smem_ptr):
-    """TVM intrinsic for building a UTCCP scale factor SMEM descriptor."""
-    return call_intrin(
-        "handle",
-        _tvm_op.Op.get("tl.ptx_tcgen05_make_sf_desc"),
-        desc_var,
         smem_ptr,
     )
 

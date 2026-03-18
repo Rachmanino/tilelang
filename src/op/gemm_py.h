@@ -36,6 +36,9 @@ public:
   int kPack_ = 1;
   int wgWait_ = 0;
   mutable GemmWarpPolicy policy_;
+  // Block-scaled GEMM: optional scale factor regions and IDs
+  BufferRegion sfaRegion_, sfbRegion_;
+  PrimExpr sfAId_, sfBId_;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmPy", GemmPyNode, TileOperatorNode);
 
@@ -62,7 +65,11 @@ public:
         .def_ro("cCoords", &GemmPyNode::cCoords_)
         .def_ro("kPack", &GemmPyNode::kPack_)
         .def_ro("wgWait", &GemmPyNode::wgWait_)
-        .def_ro("policy", &GemmPyNode::policy_);
+        .def_ro("policy", &GemmPyNode::policy_)
+        .def_ro("sfaRegion", &GemmPyNode::sfaRegion_)
+        .def_ro("sfbRegion", &GemmPyNode::sfbRegion_)
+        .def_ro("sfAId", &GemmPyNode::sfAId_)
+        .def_ro("sfBId", &GemmPyNode::sfBId_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;

@@ -87,6 +87,19 @@ GemmPy::GemmPy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
+  // Block-scaled GEMM: optional SFA, SFB regions and scale factor IDs
+  if (args.size() > 19) {
+    node->sfaRegion_ = NormalizeToBufferRegion(args[19]);
+  }
+  if (args.size() > 20) {
+    node->sfbRegion_ = NormalizeToBufferRegion(args[20]);
+  }
+  if (args.size() > 21) {
+    node->sfAId_ = args[21].as<PrimExpr>().value();
+  }
+  if (args.size() > 22) {
+    node->sfBId_ = args[22].as<PrimExpr>().value();
+  }
   data_ = std::move(node);
 }
 

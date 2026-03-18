@@ -2549,8 +2549,8 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("(SFB_offset)", sfb_offset);
     tcgen05_call = replacer.rewrite(tcgen05_call);
     this->stream << tcgen05_call;
-  } else if (op->op.same_as(tl::ptx_tcgen05_utccp())) {
-    ICHECK_EQ(op->args.size(), 3U) << "ptx_tcgen05_utccp expects 3 arguments";
+  } else if (op->op.same_as(tl::ptx_tcgen05_cp())) {
+    ICHECK_EQ(op->args.size(), 3U) << "ptx_tcgen05_cp expects 3 arguments";
     need_tcgen05_common_h_ = true;
     // arg[0] = smem pointer, arg[1] = tmem data pointer, arg[2] = tmem column offset
     std::string smem_ptr = this->PrintExpr(op->args[0]);
@@ -2568,14 +2568,6 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     this->PrintIndent();
     this->stream << "tl::tcgen05_sf_warp_transpose(reinterpret_cast<uint32_t*>("
                  << smem_ptr << "));\n";
-  } else if (op->op.same_as(tl::ptx_tcgen05_make_sf_desc())) {
-    ICHECK_EQ(op->args.size(), 2U)
-        << "ptx_tcgen05_make_sf_desc expects 2 arguments";
-    need_tcgen05_common_h_ = true;
-    this->PrintIndent();
-    this->stream << this->PrintExpr(op->args[0]) << " = "
-                 << "tl::make_sf_smem_desc(reinterpret_cast<void*>("
-                 << this->PrintExpr(op->args[1]) << "));\n";
   } else if (op->op.same_as(tl::tcgen05_mma_arrive())) {
     ICHECK_EQ(op->args.size(), 1U) << "tcgen05_mma_arrive expects 1 argument";
     need_tcgen05_common_h_ = true;

@@ -10,7 +10,6 @@
 import torch
 import tilelang
 import tilelang.language as T
-from tilelang.layout import make_full_bank_swizzled_layout
 from tilelang.profiler import do_bench
 
 tilelang.disable_cache()
@@ -73,15 +72,6 @@ def mxfp8_blockscaled_gemm(
         consumed = T.alloc_barrier([1] * num_stages)
         tmem_full = T.alloc_barrier([1])
 
-        # Annotate shared memory layouts so TMA writes data in the swizzled format
-        # that the MMA descriptor expects (128B swizzle = full-bank swizzle).
-        # Without this, TMA defaults to linear layout, causing a swizzle mismatch.
-        T.annotate_layout({
-            A_shared: make_full_bank_swizzled_layout(A_shared),
-            B_shared: make_full_bank_swizzled_layout(B_shared),
-            C_tmem: T.make_blockscaled_gemm_layout(C_tmem, A_shared[0, :, :]),
-        })
-
         tx = T.get_thread_binding()
         T.use_swizzle(8)
 
@@ -116,7 +106,6 @@ def mxfp8_blockscaled_gemm(
             # Warp 1: MMA issue + SF transpose/UTCCP
             for k in T.serial(k_iters):
                 T.mbarrier_wait_parity(loaded[k % num_stages], (k // num_stages) & 1)
-                T.tcgen05_after_thread_sync()
 
                 # SF transpose + UTCCP when new SF was loaded
                 # Each call handles 128 uint32 elements = 4 TMEM columns
@@ -164,9 +153,6 @@ def main():
     sf_granularity_k = 128
 
     a = torch.randn(M, K, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
-    # this is correct 
-    # b = torch.full((K, N), 3, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
-    # not correct 
     b = torch.randn(K, N, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
 
     # Pack scale factors: 4 uint8 E8M0 values per uint32
@@ -207,6 +193,7 @@ def main():
     print(f"Output shape: {c.shape}, dtype: {c.dtype}")
     print(f"Max abs error: {(c.float() - ref_c.float()).abs().max().item():.6f}")
     print(f'{c=}, {ref_c=}')
+    # torch.testing.assert_close(c, ref_c)
 
     tl_latency = do_bench(
         lambda: mxfp8_blockscaled_gemm(

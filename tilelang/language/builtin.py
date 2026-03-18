@@ -1045,7 +1045,7 @@ def tcgen05_cp(smem_src, tmem_dst, tmem_col_offset=0):
         tmem_ptr = tmem_dst.buffer.data
     else:
         tmem_ptr = tmem_dst
-    return tir.call_intrin("void", tir.op.Op.get("tl.ptx_tcgen05_utccp"), smem_ptr, tmem_ptr, tmem_col_offset)
+    return tir.call_intrin("void", tir.op.Op.get("tl.ptx_tcgen05_cp"), smem_ptr, tmem_ptr, tmem_col_offset)
 
 
 def sf_warp_transpose(smem_src):
@@ -1061,19 +1061,6 @@ def sf_warp_transpose(smem_src):
     """
     smem_ptr = retrieve_ptr(smem_src, access_type="rw")
     return tir.call_intrin("void", tir.op.Op.get("tl.ptx_tcgen05_sf_warp_transpose"), smem_ptr)
-
-
-def make_sf_smem_desc(desc_var: PrimExpr, smem_ptr: PrimExpr):
-    """Build a SMEM descriptor for UTCCP scale factor copy.
-
-    Parameters
-    ----------
-    desc_var : PrimExpr
-        Variable to store the resulting uint64 descriptor.
-    smem_ptr : PrimExpr
-        Pointer to scale factor data in shared memory.
-    """
-    return tir.call_intrin("void", tir.op.Op.get("tl.ptx_tcgen05_make_sf_desc"), desc_var, smem_ptr)
 
 
 def ptx_mma_sm70(

@@ -240,15 +240,11 @@ def blockscaled_gemm(
     sf_a_id: int = 0,
     sf_b_id: int = 0,
 ) -> tir.PrimExpr:
-    """Block-scaled GEMM for MXFP8 on SM100 (Blackwell).
+    """Block-scaled GEMM
+    Currently only support MXFP8 for SM100, lowered to tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale instructions.
 
-    Issues ``tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale`` instructions.
     A, B are FP8 (E4M3/E5M2) in shared memory, C is accumulator in tensor memory.
-    SFA_tmem, SFB_tmem are E8M0 scale factors already in tensor memory (loaded via UTCCP).
-
-    This function is designed for warp-specialized schedules where one warp issues MMA.
-    Scale factor loading (TMA → smem → transpose → UTCCP → tmem) must be managed by
-    the user schedule (see examples/gemm_sm100/gemm_mxfp8_blockscaled.py).
+    SFA_tmem, SFB_tmem are E8M0 scale factors already in tensor memory.
 
     Args:
         A: FP8 input buffer A in shared memory.
@@ -264,10 +260,6 @@ def blockscaled_gemm(
         sf_a_id: Scale factor ID for A (0-3).
         sf_b_id: Scale factor ID for B (0-3).
     """
-    from tilelang.intrinsics.tcgen05_macro_generator import (
-        TensorCoreIntrinEmitter,
-    )
-    from tilelang.layout import make_full_bank_swizzled_layout
 
     def legalize(arg):
         if isinstance(arg, tir.Var) and T.has_let_value(arg):
@@ -284,46 +276,85 @@ def blockscaled_gemm(
     A_region = to_buffer_region(A)
     B_region = to_buffer_region(B)
     C_region = to_buffer_region(C)
+    SFA_region = to_buffer_region(SFA_tmem)
+    SFB_region = to_buffer_region(SFB_tmem)
 
     A_shape = retrieve_shape(A_region)
     B_shape = retrieve_shape(B_region)
     C_shape = retrieve_shape(C_region)
 
-    M, N = int(C_shape[0]), int(C_shape[1])
-    K = int(A_shape[-2] if transpose_A else A_shape[-1])
+    assert len(C_shape) == 2, "current only support C as a 2D tensor"
+    assert len(A_shape) >= 2, "current only support A as a 2D or higher-order tensor"
+    assert len(B_shape) >= 2, "current only support B as a 2D or higher-order tensor"
 
-    a_dtype = str(A_region.buffer.dtype)
-    accum_dtype = str(C_region.buffer.dtype)
+    M, N = C_shape
+    K = A_shape[-2] if transpose_A else A_shape[-1]
+    K_B = B_shape[-1] if transpose_B else B_shape[-2]
+    assert prim_expr_equal(K, K_B), f"T.blockscaled_gemm K shape check failed: K_A = {K}, K_B = {K_B}"
 
-    # Create intrinsic emitter — for block-scaled, TCGEN5 always uses 1 warp group
-    emitter = TensorCoreIntrinEmitter(
-        a_dtype=a_dtype,
-        b_dtype=a_dtype,
-        accum_dtype=accum_dtype,
-        a_transposed=transpose_A,
-        b_transposed=transpose_B,
-        block_row_warps=1,
-        block_col_warps=1,
-        warp_row_tiles=M,
-        warp_col_tiles=N,
-        chunk=K,
-    )
+    A_stride = retrieve_stride(A_region)
+    B_stride = retrieve_stride(B_region)
+    stride_a = A_stride[-2]
+    stride_b = B_stride[-2]
 
-    # Assign shared layouts (default: full-bank swizzled for FP8).
-    # IMPORTANT: The user must annotate A_shared and B_shared with the same
-    # swizzle layout via T.annotate_layout() so that TMA writes data in the
-    # swizzled format that the MMA descriptor expects.
-    a_buf = A_region.buffer if isinstance(A_region, tir.BufferRegion) else A
-    b_buf = B_region.buffer if isinstance(B_region, tir.BufferRegion) else B
-    emitter._assign_a_shared_layout(make_full_bank_swizzled_layout(a_buf))
-    emitter._assign_b_shared_layout(make_full_bank_swizzled_layout(b_buf))
+    A_offset = retrieve_offset(A_region)
+    B_offset = retrieve_offset(B_region)
+    offset_a = A_offset[-1]
+    offset_b = B_offset[-1]
 
-    # Convert mbar to a pointer, same as the regular gemm tile-op does
-    from tilelang.utils.language import retrieve_ptr as _retrieve_ptr
-    mbarptr = _retrieve_ptr(mbar, "rw") if mbar is not None else None
-    return emitter.tcgen05mma_blockscaled(
-        A, B, C, SFA_tmem, SFB_tmem,
-        mbarptr, clear_accum, sf_a_id, sf_b_id,
+    if mbar is not None:
+        assert isinstance(mbar, (tir.Buffer, tir.BufferLoad)), (
+            f"mbar for tcgen5mma must be a tir.Buffer or tir.BufferLoad, but got {type(mbar)}"
+        )
+        mbar = to_buffer_region(mbar, access_type="rw")
+
+    C_coords = [r.min for r in C_region.region]
+
+    # Convert BufferRegion to tl.region calls for arguments
+    A_arg = buffer_region_to_tile_region(A_region, "r", [r for r in A_shape])
+    B_arg = buffer_region_to_tile_region(B_region, "r", [r for r in B_shape])
+    C_arg = buffer_region_to_tile_region(C_region, "rw", [r for r in C_shape])
+    SFA_arg = buffer_region_to_tile_region(SFA_region, "r", list(retrieve_shape(SFA_region)))
+    SFB_arg = buffer_region_to_tile_region(SFB_region, "r", list(retrieve_shape(SFB_region)))
+
+    assert mbar is not None, "mbar is required for blockscaled_gemm"
+    mbar_arg = mbar 
+
+    # Ensure sf_a_id and sf_b_id are PrimExpr
+    if not isinstance(sf_a_id, tir.PrimExpr):
+        sf_a_id = tir.const(sf_a_id, dtype="int32")
+    if not isinstance(sf_b_id, tir.PrimExpr):
+        sf_b_id = tir.const(sf_b_id, dtype="int32")
+
+    # Block-scaled always uses Square policy (1x1 warp partition)
+    policy = GemmWarpPolicy.Square
+
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.gemm_py"),
+        A_arg,
+        B_arg,
+        C_arg,
+        transpose_A,
+        transpose_B,
+        M,
+        N,
+        K,
+        policy,
+        clear_accum,
+        stride_a,
+        stride_b,
+        offset_a,
+        offset_b,
+        1,       # k_pack
+        wg_wait,
+        mbar,
+        C_coords[0],
+        C_coords[1],
+        SFA_arg,  # arg 19
+        SFB_arg,  # arg 20
+        sf_a_id,  # arg 21
+        sf_b_id,  # arg 22
     )
 
 
