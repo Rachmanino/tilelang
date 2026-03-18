@@ -145,6 +145,49 @@ def mxfp8_blockscaled_gemm(
     return C
 
 
+def blockscaled_gemm_ref(a, b, sfa_unpacked, sfb_unpacked, sf_granularity_k=128):
+    """Torch reference for block-scaled MXFP8 GEMM.
+
+    Args:
+        a: [M, K] FP8 tensor
+        b: [K, N] FP8 tensor
+        sfa_unpacked: [M, sf_k_blocks] uint8 E8M0 scale factors for A
+        sfb_unpacked: [N, sf_k_blocks] uint8 E8M0 scale factors for B
+        sf_granularity_k: number of K elements per scale factor block (default 128)
+
+    Returns:
+        [M, N] float32 result
+    """
+    M, K = a.shape
+    K2, N = b.shape
+    assert K == K2
+    sf_k_blocks = (K + sf_granularity_k - 1) // sf_granularity_k
+
+    a_f32 = a.to(torch.float32)
+    b_f32 = b.to(torch.float32)
+
+    # E8M0 exponent to float scale: 2^(exp - 127)
+    sfa_scales = torch.pow(2.0, sfa_unpacked.to(torch.float32) - 127.0)  # [M, sf_k_blocks]
+    sfb_scales = torch.pow(2.0, sfb_unpacked.to(torch.float32) - 127.0)  # [N, sf_k_blocks]
+
+    c = torch.zeros(M, N, device=a.device, dtype=torch.float32)
+    for bi in range(sf_k_blocks):
+        k_start = bi * sf_granularity_k
+        k_end = min(k_start + sf_granularity_k, K)
+        # Scale A block: [M, block_k] * [M, 1]
+        a_block = a_f32[:, k_start:k_end] * sfa_scales[:, bi:bi + 1]
+        # Scale B block: [block_k, N] * [1, N]  (sfb is [N, blocks], transpose for broadcast)
+        b_block = b_f32[k_start:k_end, :] * sfb_scales[:, bi:bi + 1].T
+        c += a_block @ b_block
+    return c
+
+
+def cosine_similarity(a, b):
+    a_flat = a.flatten().float()
+    b_flat = b.flatten().float()
+    return (a_flat @ b_flat) / (a_flat.norm() * b_flat.norm())
+
+
 def main():
     M, N, K = 8192, 8192, 8192
     block_M, block_N, block_K = 128, 256, 128
@@ -161,8 +204,8 @@ def main():
     sf_k_packed = (sf_k_blocks + 3) // 4    
 
     # Create unpacked E8M0 scale factors (exponent 127 = scale 1.0)
-    sfa_unpacked = torch.full((M, sf_k_blocks), 127, device="cuda", dtype=torch.uint8)
-    sfb_unpacked = torch.full((N, sf_k_blocks), 127, device="cuda", dtype=torch.uint8)
+    sfa_unpacked = torch.randint(127-10, 127+10, (M, sf_k_blocks), device="cuda", dtype=torch.uint8)
+    sfb_unpacked = torch.randint(127-10, 127+10, (N, sf_k_blocks), device="cuda", dtype=torch.uint8)
 
     # Pad to multiple of 4 and pack into uint32
     if sf_k_blocks % 4 != 0:
@@ -189,11 +232,13 @@ def main():
         sf_granularity_k,
     ))
 
-    ref_c = (a.to(torch.float) @ b.to(torch.float)).to(torch.bfloat16)
+    ref_c = blockscaled_gemm_ref(a, b, sfa_unpacked, sfb_unpacked, sf_granularity_k).to(torch.bfloat16)
+    sim = cosine_similarity(c, ref_c)
     print(f"Output shape: {c.shape}, dtype: {c.dtype}")
-    print(f"Max abs error: {(c.float() - ref_c.float()).abs().max().item():.6f}")
-    print(f'{c=}, {ref_c=}')
-    # torch.testing.assert_close(c, ref_c)
+    print(f"{c=}, {ref_c=}")
+    # print(f"Max abs error: {(c.float() - ref_c.float()).abs().max().item():.6f}")
+    print(f"Cosine similarity: {sim.item():.6f}")
+
 
     tl_latency = do_bench(
         lambda: mxfp8_blockscaled_gemm(
