@@ -309,7 +309,10 @@ def blockscaled_gemm(
         chunk=K,
     )
 
-    # Assign shared layouts (default: full-bank swizzled for FP8)
+    # Assign shared layouts (default: full-bank swizzled for FP8).
+    # IMPORTANT: The user must annotate A_shared and B_shared with the same
+    # swizzle layout via T.annotate_layout() so that TMA writes data in the
+    # swizzled format that the MMA descriptor expects.
     a_buf = A_region.buffer if isinstance(A_region, tir.BufferRegion) else A
     b_buf = B_region.buffer if isinstance(B_region, tir.BufferRegion) else B
     emitter._assign_a_shared_layout(make_full_bank_swizzled_layout(a_buf))

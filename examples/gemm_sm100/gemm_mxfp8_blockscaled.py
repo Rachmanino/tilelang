@@ -10,6 +10,7 @@
 import torch
 import tilelang
 import tilelang.language as T
+from tilelang.layout import make_full_bank_swizzled_layout
 from tilelang.profiler import do_bench
 
 tilelang.disable_cache()
@@ -72,8 +73,12 @@ def mxfp8_blockscaled_gemm(
         consumed = T.alloc_barrier([1] * num_stages)
         tmem_full = T.alloc_barrier([1])
 
-        # Annotate TMEM layout for C so T.copy(C_tmem, C_local) can be lowered
+        # Annotate shared memory layouts so TMA writes data in the swizzled format
+        # that the MMA descriptor expects (128B swizzle = full-bank swizzle).
+        # Without this, TMA defaults to linear layout, causing a swizzle mismatch.
         T.annotate_layout({
+            A_shared: make_full_bank_swizzled_layout(A_shared),
+            B_shared: make_full_bank_swizzled_layout(B_shared),
             C_tmem: T.make_blockscaled_gemm_layout(C_tmem, A_shared[0, :, :]),
         })
 
@@ -83,60 +88,59 @@ def mxfp8_blockscaled_gemm(
         if tx < 32:
             # Warp 0: TMA load
             for k in T.serial(k_iters):
-                stage = k % num_stages
-                T.mbarrier_wait_parity(consumed[stage], ((k // num_stages) & 1) ^ 1)
-                T.copy(
+                T.mbarrier_wait_parity(consumed[k % num_stages], ((k // num_stages) & 1) ^ 1)
+                T.tma_copy(
                     A[by * block_M:(by + 1) * block_M, k * block_K:(k + 1) * block_K],
-                    A_shared[stage, :, :],
+                    A_shared[k % num_stages, :, :],
+                    barrier=loaded[k % num_stages],
                 )
-                T.copy(
+                T.tma_copy(
                     B[k * block_K:(k + 1) * block_K, bx * block_N:(bx + 1) * block_N],
-                    B_shared[stage, :, :],
+                    B_shared[k % num_stages, :, :],
+                    barrier=loaded[k % num_stages],
                 )
                 # Load packed SF every sf_load_period iterations
                 if k % sf_load_period == 0:
                     sf_k_idx = k // sf_load_period
                     T.copy(
                         SFA[by * block_M:(by + 1) * block_M, sf_k_idx:sf_k_idx + 1],
-                        SFA_shared[stage, :],
+                        SFA_shared[k % num_stages, :],
                     )
                     T.copy(
                         SFB[bx * block_N:(bx + 1) * block_N, sf_k_idx:sf_k_idx + 1],
-                        SFB_shared[stage, :],
+                        SFB_shared[k % num_stages, :],
                     )
-                T.mbarrier_arrive(loaded[stage])
+                T.mbarrier_arrive(loaded[k % num_stages])
 
         elif tx < 64:
             # Warp 1: MMA issue + SF transpose/UTCCP
             for k in T.serial(k_iters):
-                stage = k % num_stages
-                T.mbarrier_wait_parity(loaded[stage], (k // num_stages) & 1)
+                T.mbarrier_wait_parity(loaded[k % num_stages], (k // num_stages) & 1)
                 T.tcgen05_after_thread_sync()
 
                 # SF transpose + UTCCP when new SF was loaded
                 # Each call handles 128 uint32 elements = 4 TMEM columns
                 if k % sf_load_period == 0:
                     for ci in range(sfa_num_chunks):
-                        T.sf_warp_transpose(SFA_shared[stage, ci * 128])
+                        T.sf_warp_transpose(SFA_shared[k % num_stages, ci * 128])
                     for ci in range(sfb_num_chunks):
-                        T.sf_warp_transpose(SFB_shared[stage, ci * 128])
+                        T.sf_warp_transpose(SFB_shared[k % num_stages, ci * 128])
                     for ci in range(sfa_num_chunks):
-                        T.tcgen05_cp(SFA_shared[stage, ci * 128], SFA_tmem, tmem_col_offset=ci * 4)
+                        T.tcgen05_cp(SFA_shared[k % num_stages, ci * 128], SFA_tmem, tmem_col_offset=ci * 4)
                     for ci in range(sfb_num_chunks):
-                        T.tcgen05_cp(SFB_shared[stage, ci * 128], SFB_tmem, tmem_col_offset=ci * 4)
+                        T.tcgen05_cp(SFB_shared[k % num_stages, ci * 128], SFB_tmem, tmem_col_offset=ci * 4)
 
                 # sf_id selects which of the 4 packed E8M0 values to use
-                sf_id = k % sf_load_period
                 T.blockscaled_gemm(
-                    A_shared[stage, :, :],
-                    B_shared[stage, :, :],
+                    A_shared[k % num_stages, :, :],
+                    B_shared[k % num_stages, :, :],
                     C_tmem,
                     SFA_tmem,
                     SFB_tmem,
-                    mbar=consumed[stage],
+                    mbar=consumed[k % num_stages],
                     clear_accum=k == 0,
-                    sf_a_id=sf_id,
-                    sf_b_id=sf_id,
+                    sf_a_id=k % sf_load_period,
+                    sf_b_id=k % sf_load_period,
                 )
 
             T.tcgen05_mma_arrive(tmem_full)
@@ -153,14 +157,18 @@ def mxfp8_blockscaled_gemm(
 
 
 def main():
-    M, N, K = 128, 256, 128
+    M, N, K = 8192, 8192, 8192
     block_M, block_N, block_K = 128, 256, 128
     in_dtype, out_dtype, accum_dtype = T.float8_e4m3fn, T.bfloat16, T.float
-    num_stages = 1
+    num_stages = 4
     sf_granularity_k = 128
 
     a = torch.randn(M, K, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
-    b = torch.full((K, N), 3, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
+    # this is correct 
+    # b = torch.full((K, N), 3, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
+    # not correct 
+    b = torch.randn(K, N, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
+
     # Pack scale factors: 4 uint8 E8M0 values per uint32
     # Each uint32 covers 4 * sf_granularity_k = 512 K elements
     sf_k_blocks = (K + sf_granularity_k - 1) // sf_granularity_k
