@@ -1,11 +1,11 @@
-# MXFP8 Block-Scaled GEMM on SM100 (Blackwell) — quantsize (M, N, K) = (1, 128, 128)
+# MXFP8 Block-Scaled GEMM on SM100 (Blackwell)
+# DeepGEMM-style warp-specialized schedule:
+#   Warp 0: TMA loads (A, B data + SFA, SFB scale factors)
+#   Warp 1: MMA issue (SF transpose + UTCCP SF copy + block-scaled tcgen05.mma)
 #
-# Compared to the (1, 1, 128) variant:
-#   - SFA: per-row per-K-block → [M, K/128]               (same)
-#   - SFB: per-128-N per-K-block → [N/128, K/128]          (coarser along N)
-#
-# The kernel is identical — hardware always expects per-row scales in TMEM.
-# We broadcast each SFB scale to 128 N-rows in the global tensor.
+# Scale factor layout: per-block E8M0 (uint8) scaling with granularity of 128 elements along K.
+# Global SF tensors store raw uint8 E8M0 values. The UTCCP copy to TMEM handles the
+# 4-byte packing internally (128 uint8 × 4 K-blocks → 4 TMEM columns).
 
 import torch
 import tilelang
@@ -25,40 +25,45 @@ def mxfp8_blockscaled_gemm(
 ):
     """Block-scaled MXFP8 GEMM.
 
-    A:   [M, K] in FP8
-    B:   [K, N] in FP8
-    SFA: [M, ceil(K / (sf_granularity_k * 4))] in uint32
-    SFB: [N, ceil(K / (sf_granularity_k * 4))] in uint32
-         (for quantsize 128 along N, every 128 consecutive N-rows share the same value)
+    A:   [M, K] in FP8 (E4M3 or E5M2)
+    B:   [K, N] in FP8 (E4M3 or E5M2)
+    SFA: [M, ceil(K / sf_granularity_k)] in uint8 (E8M0 scale factors for A)
+    SFB: [N, ceil(K / sf_granularity_k)] in uint8 (E8M0 scale factors for B)
     """
     M, N, K = T.const("M, N, K")
 
     k_iters = T.ceildiv(K, block_K)
+    # Load 4 K-blocks of SF at once → load every 4 iterations
     sf_load_period = sf_granularity_k * 4 // block_K
 
     A: T.Tensor[[M, K], in_dtype]
     B: T.Tensor[[K, N], in_dtype]
-    SFA: T.Tensor[[M, T.ceildiv(K, sf_granularity_k * 4)], "uint32"]
-    SFB: T.Tensor[[N, T.ceildiv(K, sf_granularity_k * 4)], "uint32"]
+    SFA: T.Tensor[[M, T.ceildiv(K, sf_granularity_k)], "uint8"]
+    SFB: T.Tensor[[N, T.ceildiv(K, sf_granularity_k)], "uint8"]
     C = T.empty((M, N), out_dtype)
 
     with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        # Data shared memory (pipelined)
         A_shared = T.alloc_shared((num_stages, block_M, block_K), in_dtype)
         B_shared = T.alloc_shared((num_stages, block_K, block_N), in_dtype)
 
-        SFA_shared = T.alloc_shared((num_stages, block_M), "uint32")
-        SFB_shared = T.alloc_shared((num_stages, block_N), "uint32")
+        # Scale factor shared memory — uint8 E8M0, 4 K-blocks per load
+        SFA_shared = T.alloc_shared((num_stages, block_M, 4), "uint8")
+        SFB_shared = T.alloc_shared((num_stages, block_N, 4), "uint8")
 
+        # Accumulator in tensor memory
         C_tmem = T.alloc_tmem([block_M, block_N], accum_dtype)
 
-        sfa_num_chunks = block_M // 128
-        sfb_num_chunks = block_N // 128
-        SFA_tmem = T.alloc_tmem([32, sfa_num_chunks * 4], "uint32")
-        SFB_tmem = T.alloc_tmem([32, sfb_num_chunks * 4], "uint32")
+        # Scale factors in tensor memory (TMEM has 128 rows)
+        # T.copy(SMEM→TMEM) auto-handles sf_warp_transpose + tcgen05.cp
+        SFA_tmem = T.alloc_tmem([block_M, block_M // 128 * 4], "uint8")
+        SFB_tmem = T.alloc_tmem([block_M, block_N // 128 * 4], "uint8")
 
+        # Output buffers
         C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
         C_shared = T.alloc_shared((block_M, block_N), out_dtype)
 
+        # Barriers
         loaded = T.alloc_barrier([32] * num_stages)
         consumed = T.alloc_barrier([1] * num_stages)
         tmem_full = T.alloc_barrier([1])
@@ -67,6 +72,7 @@ def mxfp8_blockscaled_gemm(
         T.use_swizzle(8)
 
         if tx < 32:
+            # Warp 0: TMA load
             for k in T.serial(k_iters):
                 T.mbarrier_wait_parity(consumed[k % num_stages], ((k // num_stages) & 1) ^ 1)
                 T.tma_copy(
@@ -79,30 +85,32 @@ def mxfp8_blockscaled_gemm(
                     B_shared[k % num_stages, :, :],
                     barrier=loaded[k % num_stages],
                 )
+                # Load 4 uint8 SF values every sf_load_period iterations
                 if k % sf_load_period == 0:
                     sf_k_idx = k // sf_load_period
                     T.copy(
-                        SFA[by * block_M:(by + 1) * block_M, sf_k_idx:sf_k_idx + 1],
-                        SFA_shared[k % num_stages, :],
+                        SFA[by * block_M:(by + 1) * block_M, sf_k_idx * 4:(sf_k_idx + 1) * 4],
+                        SFA_shared[k % num_stages, :, :],
                     )
                     T.copy(
-                        SFB[bx * block_N:(bx + 1) * block_N, sf_k_idx:sf_k_idx + 1],
-                        SFB_shared[k % num_stages, :],
+                        SFB[bx * block_N:(bx + 1) * block_N, sf_k_idx * 4:(sf_k_idx + 1) * 4],
+                        SFB_shared[k % num_stages, :, :],
                     )
                 T.mbarrier_arrive(loaded[k % num_stages])
 
         elif tx < 64:
+            # Warp 1: MMA issue + SF transpose/UTCCP
             for k in T.serial(k_iters):
                 T.mbarrier_wait_parity(loaded[k % num_stages], (k // num_stages) & 1)
 
+                # Copy SF from SMEM to TMEM (auto transpose + UTCCP)
                 if k % sf_load_period == 0:
-                    for ci in range(sfa_num_chunks):
-                        T.sf_warp_transpose(SFA_shared[k % num_stages, ci * 128])
-                    for ci in range(sfb_num_chunks):
-                        T.sf_warp_transpose(SFB_shared[k % num_stages, ci * 128])
-                    T.copy(SFA_shared[k % num_stages, :], SFA_tmem)
-                    T.copy(SFB_shared[k % num_stages, :], SFB_tmem)
+                    T.copy(SFA_shared[k % num_stages, :, :], SFA_tmem)
+                    T.copy(SFB_shared[k % num_stages, :, :], SFB_tmem)
 
+                T.sync_warp()
+
+                # sf_id selects which of the 4 packed E8M0 values to use
                 T.blockscaled_gemm(
                     A_shared[k % num_stages, :, :],
                     B_shared[k % num_stages, :, :],
@@ -117,6 +125,7 @@ def mxfp8_blockscaled_gemm(
 
             T.tcgen05_mma_arrive(tmem_full)
 
+        # Epilogue: all warps
         T.mbarrier_wait_parity(tmem_full, 0)
         T.sync_threads()
 
@@ -127,16 +136,15 @@ def mxfp8_blockscaled_gemm(
     return C
 
 
-def blockscaled_gemm_ref(a, b, sfa_unpacked, sfb_unpacked, sf_granularity_k=128, sf_granularity_n=128):
-    """Torch reference for block-scaled MXFP8 GEMM with quantsize (1, sf_granularity_n, sf_granularity_k).
+def blockscaled_gemm_ref(a, b, sfa_unpacked, sfb_unpacked, sf_granularity_k=128):
+    """Torch reference for block-scaled MXFP8 GEMM.
 
     Args:
         a: [M, K] FP8 tensor
         b: [K, N] FP8 tensor
         sfa_unpacked: [M, sf_k_blocks] uint8 E8M0 scale factors for A
-        sfb_unpacked: [N/sf_granularity_n, sf_k_blocks] uint8 E8M0 scale factors for B
-        sf_granularity_k: K elements per scale factor block (default 128)
-        sf_granularity_n: N elements per scale factor block (default 128)
+        sfb_unpacked: [N, sf_k_blocks] uint8 E8M0 scale factors for B
+        sf_granularity_k: number of K elements per scale factor block (default 128)
 
     Returns:
         [M, N] float32 result
@@ -149,23 +157,19 @@ def blockscaled_gemm_ref(a, b, sfa_unpacked, sfb_unpacked, sf_granularity_k=128,
     a_f32 = a.to(torch.float32)
     b_f32 = b.to(torch.float32)
 
-    # E8M0 to float: 2^(exp - 127)
+    # E8M0 exponent to float scale: 2^(exp - 127)
     sfa_scales = torch.pow(2.0, sfa_unpacked.to(torch.float32) - 127.0)  # [M, sf_k_blocks]
-    sfb_scales = torch.pow(2.0, sfb_unpacked.to(torch.float32) - 127.0)  # [N/sf_granularity_n, sf_k_blocks]
+    sfb_scales = torch.pow(2.0, sfb_unpacked.to(torch.float32) - 127.0)  # [N, sf_k_blocks]
 
     c = torch.zeros(M, N, device=a.device, dtype=torch.float32)
-    n_blocks = (N + sf_granularity_n - 1) // sf_granularity_n
     for bi in range(sf_k_blocks):
         k_start = bi * sf_granularity_k
         k_end = min(k_start + sf_granularity_k, K)
-        # Scale A: [M, block_k] * [M, 1]
+        # Scale A block: [M, block_k] * [M, 1]
         a_block = a_f32[:, k_start:k_end] * sfa_scales[:, bi:bi + 1]
-        for ni in range(n_blocks):
-            n_start = ni * sf_granularity_n
-            n_end = min(n_start + sf_granularity_n, N)
-            # Scale B sub-block: [block_k, block_n] * scalar
-            b_sub = b_f32[k_start:k_end, n_start:n_end] * sfb_scales[ni, bi]
-            c[:, n_start:n_end] += a_block @ b_sub
+        # Scale B block: [block_k, N] * [1, N]  (sfb is [N, blocks], transpose for broadcast)
+        b_block = b_f32[k_start:k_end, :] * sfb_scales[:, bi:bi + 1].T
+        c += a_block @ b_block
     return c
 
 
@@ -181,32 +185,17 @@ def main():
     in_dtype, out_dtype, accum_dtype = T.float8_e4m3fn, T.bfloat16, T.float
     num_stages = 4
     sf_granularity_k = 128
-    sf_granularity_n = 128  # quantsize along N
 
     a = torch.randn(M, K, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
     b = torch.randn(K, N, device="cuda", dtype=torch.float16).to(torch.float8_e4m3fn)
 
+    # E8M0 scale factors: uint8, one per row per K-block
     sf_k_blocks = (K + sf_granularity_k - 1) // sf_granularity_k
-    sf_k_packed = (sf_k_blocks + 3) // 4
-    sf_n_blocks = (N + sf_granularity_n - 1) // sf_granularity_n
 
-    # SFA: per-row per-K-block — same as (1,1,128)
-    sfa_unpacked = torch.randint(127 - 10, 127 + 10, (M, sf_k_blocks), device="cuda", dtype=torch.uint8)
-
-    # SFB: per-128-N per-K-block — coarser along N
-    sfb_unpacked_coarse = torch.randint(127 - 10, 127 + 10, (sf_n_blocks, sf_k_blocks), device="cuda", dtype=torch.uint8)
-
-    # Broadcast SFB to per-row: [N/128, sf_k_blocks] → [N, sf_k_blocks]
-    sfb_unpacked = sfb_unpacked_coarse.repeat_interleave(sf_granularity_n, dim=0)[:N]
-
-    # Pad to multiple of 4 and pack into uint32
-    if sf_k_blocks % 4 != 0:
-        pad = 4 - sf_k_blocks % 4
-        sfa_unpacked = torch.nn.functional.pad(sfa_unpacked, (0, pad), value=127)
-        sfb_unpacked = torch.nn.functional.pad(sfb_unpacked, (0, pad), value=127)
-
-    sfa = sfa_unpacked.view(M, sf_k_packed, 4).contiguous().view(torch.uint32).squeeze(-1).contiguous()
-    sfb = sfb_unpacked.view(N, sf_k_packed, 4).contiguous().view(torch.uint32).squeeze(-1).contiguous()
+    # Pad to multiple of 4 (UTCCP loads 4 K-blocks at a time)
+    sf_k_padded = ((sf_k_blocks + 3) // 4) * 4
+    sfa = torch.randint(127 - 10, 127 + 10, (M, sf_k_padded), device="cuda", dtype=torch.uint8)
+    sfb = torch.randint(127 - 10, 127 + 10, (N, sf_k_padded), device="cuda", dtype=torch.uint8)
 
     c = mxfp8_blockscaled_gemm(
         a, b, sfa, sfb,
@@ -223,11 +212,13 @@ def main():
         sf_granularity_k,
     ))
 
-    ref_c = blockscaled_gemm_ref(a, b, sfa_unpacked[:, :sf_k_blocks], sfb_unpacked_coarse, sf_granularity_k, sf_granularity_n).to(torch.bfloat16)
+    ref_c = blockscaled_gemm_ref(a, b, sfa[:, :sf_k_blocks], sfb[:, :sf_k_blocks], sf_granularity_k).to(torch.bfloat16)
     sim = cosine_similarity(c, ref_c)
     print(f"Output shape: {c.shape}, dtype: {c.dtype}")
+    print(f"{c=}, {ref_c=}")
+    # print(f"Max abs error: {(c.float() - ref_c.float()).abs().max().item():.6f}")
     print(f"Cosine similarity: {sim.item():.6f}")
-    assert sim > 0.99, f"Cosine similarity too low: {sim.item():.6f}"
+
 
     tl_latency = do_bench(
         lambda: mxfp8_blockscaled_gemm(

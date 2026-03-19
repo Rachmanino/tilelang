@@ -1284,28 +1284,30 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
   }
   // tcgen05.cp: shared memory → tensor memory
   if (is_cp) {
-    // Each tcgen05.cp.cta_group::1.32x128b.warpx4 copies 128 uint32 = 4 TMEM columns.
-    // We emit one call per 128-element chunk, with the first warp in
-    // thread_bounds executing (elect_one_sync inside the C++ template picks
-    // one thread within that warp).
+    // SMEM → TMEM copy for scale factors (UTCCP).
+    // Automatically emits sf_warp_transpose (in-place [4][32] → [32][4] transpose
+    // in SMEM to match tcgen05.cp.warpx4 hardware read pattern) followed by
+    // tcgen05.cp.cta_group::1.32x128b.warpx4 (512 bytes = 4 TMEM columns per call).
+    // Currently supports uint8 and uint32 source dtypes.
     constexpr int WARP_SIZE = 32;
-    constexpr int ELEMENTS_PER_CP = 128;
+    constexpr int BYTES_PER_CP = 512;  // 128 uint32 = 512 bytes per tcgen05.cp call
     constexpr int COLS_PER_CP = 4;
 
-    ICHECK(src->dtype == DataType::UInt(32))
-        << "tcgen05.cp currently requires uint32 source data, got " << src->dtype;
+    int dtype_bytes = src->dtype.bytes();
 
-    // Compute total elements from the copy region
+    // Compute total bytes from the copy region
     int64_t total_elements = 1;
     for (const auto &r : src_range) {
       auto ext = as_const_int(r->extent);
       ICHECK(ext) << "tcgen05.cp requires constant source region extents";
       total_elements *= *ext;
     }
-    ICHECK(total_elements % ELEMENTS_PER_CP == 0)
-        << "tcgen05.cp requires source element count to be a multiple of "
-        << ELEMENTS_PER_CP << ", got " << total_elements;
-    int num_calls = static_cast<int>(total_elements / ELEMENTS_PER_CP);
+    int64_t total_bytes = total_elements * dtype_bytes;
+    ICHECK(total_bytes % BYTES_PER_CP == 0)
+        << "tcgen05.cp requires source byte count to be a multiple of "
+        << BYTES_PER_CP << ", got " << total_bytes;
+    int num_calls = static_cast<int>(total_bytes / BYTES_PER_CP);
+    int elements_per_cp = BYTES_PER_CP / dtype_bytes;
 
     // Compute flat element offset of region start via row-major strides
     int ndim = static_cast<int>(src->shape.size());
@@ -1316,26 +1318,35 @@ Stmt CopyNode::LowerTmemCopy(const LowerArgs &T,
       stride = stride * src->shape[i];
     }
 
-    // SMEM base access_ptr
+    // SMEM access_ptr helpers
     PrimExpr ptype = tir::TypeAnnotation(src->dtype);
-    auto make_smem_ptr = [&](PrimExpr elem_offset) {
+    auto make_smem_ptr = [&](PrimExpr elem_offset, int num_elems) {
       return Call(DataType::Handle(), builtin::tvm_access_ptr(),
                   {ptype, src->data, elem_offset,
-                   IntImm(DataType::Int(32), ELEMENTS_PER_CP),
+                   IntImm(DataType::Int(32), num_elems),
                    IntImm(DataType::Int(32), 1 /*read*/)});
     };
 
     // TMEM data pointer
     PrimExpr tmem_ptr = dst->data;
 
-    // Build a sequence of ptx_tcgen05_cp calls
+    // Build: for each 512-byte chunk, emit sf_warp_transpose + tcgen05_cp
     std::vector<Stmt> stmts;
     for (int i = 0; i < num_calls; ++i) {
-      PrimExpr smem_ptr = make_smem_ptr(flat_offset + i * ELEMENTS_PER_CP);
+      PrimExpr chunk_offset = flat_offset + i * elements_per_cp;
+
+      // 1. sf_warp_transpose: in-place [4][32] → [32][4] transpose for warpx4
+      PrimExpr transpose_ptr = make_smem_ptr(chunk_offset, elements_per_cp);
+      stmts.push_back(Evaluate(
+          Call(DataType::Void(), ptx_tcgen05_sf_warp_transpose(),
+               {transpose_ptr})));
+
+      // 2. tcgen05.cp: copy transposed data from SMEM to TMEM
+      PrimExpr cp_ptr = make_smem_ptr(chunk_offset, elements_per_cp);
       PrimExpr col_offset = IntImm(DataType::Int(32), i * COLS_PER_CP);
       stmts.push_back(Evaluate(
           Call(DataType::Void(), ptx_tcgen05_cp(),
-               {smem_ptr, tmem_ptr, col_offset})));
+               {cp_ptr, tmem_ptr, col_offset})));
     }
 
     Stmt body = stmts[0];
