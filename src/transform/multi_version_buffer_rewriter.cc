@@ -341,15 +341,17 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     stmt_stack_.push_back(op);
-    loop_stack_.emplace_back(op->loop_var, op->extent);
     auto num_stages_anno = op->annotations.Get("num_stages");
     if (!num_stages_anno) {
+      // Serial outer loops (e.g. TileSchedule's w_tile_sched) must not join loop_stack_:
+      // version_index must stay per-tile (k-only). Their contribution is folded into
+      // parity_cycle_ via parity_linear_total (see below).
       auto for_node = StmtExprMutator::VisitStmt_(op);
-      loop_stack_.pop_back();
       stmt_stack_.pop_back();
       return for_node;
     }
 
+    loop_stack_.emplace_back(op->loop_var, op->extent);
     ICHECK(num_stages_anno->as<IntImmNode>());
     int num_stages = static_cast<int>(num_stages_anno->as<IntImmNode>()->value);
 
@@ -474,20 +476,43 @@ private:
         buffer_data_to_buffer_.Set(buffer_var, buffer);
       }
     }
-    PrimExpr linear_index = loop_stack_[0].first;
+    PrimExpr pipeline_linear = loop_stack_[0].first;
     for (size_t i = 1; i < loop_stack_.size(); ++i) {
-      linear_index =
-          linear_index * loop_stack_[i].second + loop_stack_[i].first;
+      pipeline_linear = pipeline_linear * loop_stack_[i].second +
+                        loop_stack_[i].first;
     }
-    version_index_ = FloorMod(linear_index, num_stages);
-    // Parity cycles every num_stages iterations for mbarrier phase tracking.
-    parity_cycle_ = FloorMod(FloorDiv(linear_index, num_stages), 2);
+    version_index_ = FloorMod(pipeline_linear, num_stages);
+    // Per-tile parity from k only (for barrier-specific offset vs. user/injected parity).
+    local_parity_cycle_ =
+        FloorMod(FloorDiv(pipeline_linear, num_stages), 2);
+    // Global parity across persistent wave: same as one linear loop 0..(w*K + k).
+    PrimExpr parity_linear_total = pipeline_linear;
+    PrimExpr wave_stride = make_const(pipeline_linear.dtype(), 1);
+    for (const auto &p : loop_stack_) {
+      wave_stride = wave_stride * p.second;
+    }
+    for (const StmtNode *st : stmt_stack_) {
+      const auto *fo =
+          tvm::ffi::GetRef<Stmt>(const_cast<StmtNode *>(st)).as<ForNode>();
+      if (!fo || fo == op)
+        continue;
+      if (fo->annotations.Get("num_stages"))
+        continue;
+      // TileSchedule persistent loop (name stable with tile_schedule.cc).
+      if (fo->loop_var->name_hint == "w_tile_sched") {
+        parity_linear_total = fo->loop_var * wave_stride + parity_linear_total;
+        break;
+      }
+    }
+    parity_cycle_ =
+        FloorMod(FloorDiv(parity_linear_total, num_stages), 2);
     // Store the pipelined loop variable and its min value so we can compute
     // the initial-phase offset of each mbarrier_wait_parity expression.
     pipeline_loop_var_ = op->loop_var;
     pipeline_loop_min_ = op->min;
     auto for_node = StmtExprMutator::VisitStmt_(op);
     parity_cycle_ = PrimExpr(); // reset
+    local_parity_cycle_ = PrimExpr();
     pipeline_loop_var_ = Var();
     pipeline_loop_min_ = PrimExpr();
     loop_stack_.pop_back();
@@ -549,8 +574,10 @@ private:
     if (call->op.same_as(mbarrier_wait_parity()) && parity_cycle_.defined()) {
       if (auto load = call->args[0].as<BufferLoadNode>()) {
         if (load->buffer.scope() == "shared.barrier") {
+          // parity_cycle_ includes persistent outer iters; compare offset using
+          // local_parity_cycle_ (k-only) so barrier-specific flips stay correct.
           PrimExpr new_parity = parity_cycle_;
-          if (pipeline_loop_var_.defined()) {
+          if (pipeline_loop_var_.defined() && local_parity_cycle_.defined()) {
             arith::Analyzer analyzer;
             auto subst = [&](const Var &v) -> Optional<PrimExpr> {
               if (v.same_as(pipeline_loop_var_))
@@ -560,7 +587,7 @@ private:
             PrimExpr init_orig =
                 analyzer.Simplify(tir::Substitute(call->args[1], subst));
             PrimExpr init_cycle =
-                analyzer.Simplify(tir::Substitute(parity_cycle_, subst));
+                analyzer.Simplify(tir::Substitute(local_parity_cycle_, subst));
             PrimExpr offset =
                 analyzer.Simplify(FloorMod(init_orig - init_cycle, 2));
             if (auto *imm = offset.as<IntImmNode>()) {
@@ -612,7 +639,10 @@ private:
 
   bool barrier_only_;
   PrimExpr version_index_;
-  PrimExpr parity_cycle_; // (k / num_stages) % 2 for mbarrier parity rewriting
+  /*! \brief (k / num_stages) % 2 — k-only, for parity offset vs. injected wait. */
+  PrimExpr local_parity_cycle_;
+  /*! \brief Global (w*stride + k) parity for mbarrier_wait_parity lowering. */
+  PrimExpr parity_cycle_;
   Var pipeline_loop_var_; // loop variable of the pipelined loop
   PrimExpr pipeline_loop_min_; // min value of the pipelined loop
   std::vector<std::pair<Var, PrimExpr>> loop_stack_;

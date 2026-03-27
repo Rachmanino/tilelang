@@ -158,7 +158,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
-
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
         mod = tilelang.transform.LetInline()(mod)
@@ -174,7 +173,21 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
     # Set layouts for reducers
+    print(f"before tile schedule: {mod}")
+    # Local imports avoid circular dependency: phase <- lower <- utils <- lower
+    from tilelang.jit.adapter.utils import is_cuda_target
+
+    tile_schedule_num_blocks = 128
+    if is_cuda_target(target):
+        try:
+            from tilelang.carver.arch import driver
+
+            tile_schedule_num_blocks = driver.get_num_sms()
+        except RuntimeError:
+            pass
+    mod = tilelang.transform.TileSchedule(tile_schedule_num_blocks)(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
+    print(f"after tile schedule: {mod}")
     # Lower 2SM TCGEN5MMA and related on Blackwell target (must run before
     # LayoutInference so that the use_2cta annotation is visible to infer_layout)
     mod = tilelang.transform.LowerBlackwell2SM()(mod)
