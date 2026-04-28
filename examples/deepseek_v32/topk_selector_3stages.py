@@ -309,6 +309,13 @@ def tl_topk_stage3_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
             s_histogram = T.alloc_shared([RADIX + 1], T.int32)
             s_num_input = T.alloc_shared([2], T.int32)
             s_input_idx = T.alloc_shared([2, smem_size], T.int32)
+            # Cache the uint32 representation of round-0 candidates so the
+            # dispatch pass does not have to gather
+            # ``input[bx, s_input_idx[0, ...]]`` from HBM a second time.
+            # Round 0 carries up to ~smem_size elements (this is the hot
+            # spot — round 1+ shrink by ~RADIX each, so the extra HBM
+            # gather there is cheap and we don't bother caching).
+            s_value_cache = T.alloc_shared([smem_size], T.uint32)
 
             l_threshold_bin_id = T.alloc_var(T.int32)
             l_new_topk = T.alloc_var(T.int32)
@@ -317,6 +324,7 @@ def tl_topk_stage3_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
             l_val = T.alloc_var(T.int32)
             l_start_pos = T.alloc_var(T.int32)
             l_out_pos = T.alloc_var(T.int32)
+            l_val_uint = T.alloc_var(T.uint32)
             pos = T.alloc_var(T.int32)
 
             l_new_topk = topk
@@ -375,12 +383,18 @@ def tl_topk_stage3_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
                 T.sync_threads()
 
                 l_num_input = s_num_input[r_idx]
+                # Hist pass. In round 0 we also stash the uint32 value into
+                # ``s_value_cache`` so the dispatch pass below can skip the
+                # global gather.
                 for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
                     if s * BLOCK_SIZE + tx < l_num_input:
+                        l_val_uint = convert_to_uint32(
+                            input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]])
                         l_bin_id32 = T.cast(
-                            ((convert_to_uint32(input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]) >> (24 - round * 8)) & 0xFF), T.int32
-                        )
+                            (l_val_uint >> (24 - round * 8)) & 0xFF, T.int32)
                         T.atomic_add(s_histogram[l_bin_id32], 1)
+                        if round == 0:
+                            s_value_cache[s * BLOCK_SIZE + tx] = l_val_uint
                 T.sync_threads()
 
                 if tx < RADIX:
@@ -402,12 +416,18 @@ def tl_topk_stage3_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
                 l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
                 T.sync_threads()
 
+                # Dispatch pass. Round 0 reads the cached uint32 from smem;
+                # later rounds re-gather (their candidate set is tiny).
                 for s in T.serial(T.ceildiv(l_num_input, BLOCK_SIZE)):
                     T.sync_threads()
                     if s * BLOCK_SIZE + tx < l_num_input:
+                        if round == 0:
+                            l_val_uint = s_value_cache[s * BLOCK_SIZE + tx]
+                        else:
+                            l_val_uint = convert_to_uint32(
+                                input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]])
                         l_bin_id32 = T.cast(
-                            ((convert_to_uint32(input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]) >> (24 - round * 8)) & 0xFF), T.int32
-                        )
+                            (l_val_uint >> (24 - round * 8)) & 0xFF, T.int32)
                         if l_bin_id32 > l_threshold_bin_id:
                             pos = T.atomic_add(s_histogram[l_bin_id32 + 1], 1, return_prev=True) + l_start_pos
                             index[bx, pos] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
