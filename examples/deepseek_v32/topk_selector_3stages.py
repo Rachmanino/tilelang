@@ -156,6 +156,18 @@ def tl_topk_stage2_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
 
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
             s_histogram = T.alloc_shared([RADIX + 1], T.int32)
+            # Per-block local count of "above threshold" elements per bin
+            # (pass 1) and dual-use as a per-bin write cursor (pass 2).
+            # Index 0 is unused; bin b uses index b+1 so the layout matches
+            # the global ``direct_counter``.
+            s_local_hist = T.alloc_shared([RADIX + 1], T.int32)
+            # Per-block reserved global base offset per above-threshold bin
+            # (one ``atomic_add`` per non-empty bin per block).
+            s_local_base = T.alloc_shared([RADIX + 1], T.int32)
+            # [0] = local count of "== threshold" candidates (pass 1) /
+            # local cursor (pass 2). [1] = reserved base in
+            # ``candidate_count[bx]``.
+            s_cand_local = T.alloc_shared([2], T.int32)
 
             l_threshold_bin_id = T.alloc_var(T.int32)
             l_new_topk = T.alloc_var(T.int32)
@@ -165,6 +177,7 @@ def tl_topk_stage2_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
             l_end_idx = T.alloc_var(T.int32)
             l_bin_id32 = T.alloc_var(T.int32)
             l_bin_offset = T.alloc_var(T.int32)
+            l_local_count = T.alloc_var(T.int32)
 
             pos = T.alloc_var(T.int32)
 
@@ -201,20 +214,67 @@ def tl_topk_stage2_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out
             l_new_topk = l_new_topk - s_histogram[l_threshold_bin_id + 1]
             T.sync_threads()
 
-            # Re-scan ONLY this chunk and dispatch each element.
+            # ---------- Two-pass dispatch with block-level reservation ----------
+            # The original kernel did one global ``atomic_add(direct_counter, 1)``
+            # per above-threshold element, which is O(N) global atomics per
+            # batch. Here we instead:
+            #   pass 1: build a per-block local histogram of "above threshold"
+            #           bins in shared memory (smem atomics only).
+            #   reserve: one global ``atomic_add(direct_counter[bin], local)``
+            #            per non-empty bin per block (O(num_blocks * RADIX)
+            #            worst-case, but typically only a handful of bins
+            #            above threshold are non-empty).
+            #   pass 2: re-scan and write at
+            #            ``s_histogram[bin+1] + reserved_base[bin] + local_pos``
+            #           where ``local_pos`` comes from a smem cursor.
+            # The candidate list (== threshold bin) gets the same treatment:
+            # one global atomic per block instead of one per element.
+
+            T.fill(s_local_hist, 0)
+            if tx < 2:
+                s_cand_local[tx] = 0
+            T.sync_threads()
+
+            # Pass 1: per-bin local count (smem atomics only).
             for s in T.serial(T.ceildiv(CHUNK_SIZE, BLOCK_SIZE)):
                 input_idx = l_chunk_start + s * BLOCK_SIZE + tx
                 if input_idx < seq_len and input_idx >= l_start_idx and input_idx < l_end_idx:
                     bin_id = convert_to_uint16(input[bx, input_idx])
                     l_bin_id32 = T.cast(bin_id, T.int32)
                     if l_bin_id32 > l_threshold_bin_id:
-                        # cumsum offset is consistent across blocks; use a
-                        # per-(batch, bin) global counter for the within-bin slot.
-                        l_bin_offset = s_histogram[l_bin_id32 + 1]
-                        pos = T.atomic_add(direct_counter[bx, l_bin_id32 + 1], 1, return_prev=True)
-                        index[bx, l_bin_offset + pos] = input_idx
+                        T.atomic_add(s_local_hist[l_bin_id32 + 1], 1)
                     elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
-                        pos = T.atomic_add(candidate_count[bx], 1, return_prev=True)
+                        T.atomic_add(s_cand_local[0], 1)
+            T.sync_threads()
+
+            # Reservation: at most RADIX+1 global atomics per block.
+            # Threads [0, RADIX) each handle one bin.
+            if tx < RADIX:
+                l_local_count = s_local_hist[tx + 1]
+                if l_local_count > 0:
+                    s_local_base[tx + 1] = T.atomic_add(
+                        direct_counter[bx, tx + 1], l_local_count, return_prev=True)
+                # Reuse s_local_hist as a per-bin cursor in pass 2.
+                s_local_hist[tx + 1] = 0
+            # One atomic for the candidate slot reservation.
+            if tx == 0 and s_cand_local[0] > 0:
+                s_cand_local[1] = T.atomic_add(
+                    candidate_count[bx], s_cand_local[0], return_prev=True)
+                s_cand_local[0] = 0  # reuse as block-local cursor in pass 2
+            T.sync_threads()
+
+            # Pass 2: dispatch each element using shared-memory cursors only.
+            for s in T.serial(T.ceildiv(CHUNK_SIZE, BLOCK_SIZE)):
+                input_idx = l_chunk_start + s * BLOCK_SIZE + tx
+                if input_idx < seq_len and input_idx >= l_start_idx and input_idx < l_end_idx:
+                    bin_id = convert_to_uint16(input[bx, input_idx])
+                    l_bin_id32 = T.cast(bin_id, T.int32)
+                    if l_bin_id32 > l_threshold_bin_id:
+                        l_bin_offset = s_histogram[l_bin_id32 + 1]
+                        pos = T.atomic_add(s_local_hist[l_bin_id32 + 1], 1, return_prev=True)
+                        index[bx, l_bin_offset + s_local_base[l_bin_id32 + 1] + pos] = input_idx
+                    elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
+                        pos = T.atomic_add(s_cand_local[0], 1, return_prev=True) + s_cand_local[1]
                         if pos < smem_size:
                             candidate_idx[bx, pos] = input_idx
 
@@ -437,6 +497,7 @@ def run_regression_perf(batch=64, seq_len=32 * 1024, topk=2048):
 
 if __name__ == "__main__":
     shapes = [(8192, 256), (32768, 1024), (131072, 2048), (262144, 2048)]
+    # shapes = [(8192, 256)]
     for seq_len, topk in shapes:
         print(f"\n===== (seq_len={seq_len}, topk={topk}) =====")
         test_topk_selector(batch=1, seq_len=seq_len, topk=topk)
