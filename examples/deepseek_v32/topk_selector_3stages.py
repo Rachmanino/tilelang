@@ -28,10 +28,31 @@ BLOCK_SIZE = 1024
 # CHUNK_SIZE == BLOCK_SIZE => one element per thread, maximum block count and
 # therefore maximum SM occupancy for the histogram passes.
 CHUNK_SIZE = 4096
-# Maximum number of threshold-bucket candidates carried from stage 2 to
-# stage 3's tail pass. Assumes the threshold bucket size after the first
-# pass is < 4K elements.
+# Default / minimum number of threshold-bucket candidates carried from
+# stage 2 to stage 3's tail pass. The wrapper grows this for large
+# ``seq_len`` (the threshold bucket scales roughly as ``seq_len / 32`` for
+# random fp32). Stage 3 keeps two ping-pong buffers of this size in shared
+# memory, so the runtime cost is ``2 * smem_size * 4`` bytes per block.
 SMEM_INPUT_SIZE = 4096
+
+
+# Stage 3 holds two ping-pong buffers of ``smem_size`` int32s in shared
+# memory, so its smem cost is ``8 * smem_size`` bytes plus ~1KB. Cap at
+# 16K so we stay under the ~228KB per-block opt-in shared memory limit on
+# H100/H200 (16K * 8 = 128KB).
+SMEM_INPUT_SIZE_MAX = 16384
+
+
+def _pick_smem_input_size(seq_len: int) -> int:
+    """Pick a per-call ``smem_size`` that comfortably bounds the threshold
+    bucket. Empirically the threshold bucket holds ~``seq_len / 32``
+    elements for N(0,1) inputs; we use 1/16 for headroom and round up to
+    the next power of two (a multiple of ``BLOCK_SIZE``)."""
+    target = max(SMEM_INPUT_SIZE, (seq_len + 15) // 16)
+    p = 1
+    while p < target:
+        p <<= 1
+    return min(p, SMEM_INPUT_SIZE_MAX)
 
 
 def convert_to_uint16(x):
@@ -101,7 +122,7 @@ def tl_topk_stage1_impl(in_dtype=T.float32, out_dtype=T.int32):
 
 
 @tilelang.jit(pass_configs=pass_configs)
-def tl_topk_stage2_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
+def tl_topk_stage2_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out_dtype=T.int32):
     """Stage 2: also multi-block per batch. Every block reads the merged
     global histogram, recomputes cumsum + threshold in its own shared memory
     (cheap: 256 entries), then re-scans ONLY its own chunk:
@@ -127,7 +148,7 @@ def tl_topk_stage2_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
         index: T.Tensor[(batch, topk), out_dtype],
         global_histogram: T.Tensor[(batch, RADIX), T.int32],
         direct_counter: T.Tensor[(batch, RADIX + 1), T.int32],
-        candidate_idx: T.Tensor[(batch, SMEM_INPUT_SIZE), out_dtype],
+        candidate_idx: T.Tensor[(batch, smem_size), out_dtype],
         candidate_count: T.Tensor[(batch,), T.int32],
     ):
         with T.Kernel(T.ceildiv(seq_len, CHUNK_SIZE), batch, threads=BLOCK_SIZE) as (cx, bx):
@@ -194,14 +215,14 @@ def tl_topk_stage2_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
                         index[bx, l_bin_offset + pos] = input_idx
                     elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
                         pos = T.atomic_add(candidate_count[bx], 1, return_prev=True)
-                        if pos < SMEM_INPUT_SIZE:
+                        if pos < smem_size:
                             candidate_idx[bx, pos] = input_idx
 
     return stage2_kernel
 
 
 @tilelang.jit(pass_configs=pass_configs)
-def tl_topk_stage3_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
+def tl_topk_stage3_impl(topk, smem_size=SMEM_INPUT_SIZE, in_dtype=T.float32, out_dtype=T.int32):
     """Stage 3 (tail pass): single block per batch. Loads the threshold-bucket
     candidate list from HBM, recomputes the threshold from the global
     histogram to recover ``l_new_topk`` / ``l_start_pos``, and then runs up
@@ -218,7 +239,7 @@ def tl_topk_stage3_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
         input: T.Tensor[(batch, seq_len), in_dtype],
         index: T.Tensor[(batch, topk), out_dtype],
         global_histogram: T.Tensor[(batch, RADIX), T.int32],
-        candidate_idx: T.Tensor[(batch, SMEM_INPUT_SIZE), out_dtype],
+        candidate_idx: T.Tensor[(batch, smem_size), out_dtype],
         candidate_count: T.Tensor[(batch,), T.int32],
     ):
         with T.Kernel(batch, threads=BLOCK_SIZE) as (bx,):
@@ -227,7 +248,7 @@ def tl_topk_stage3_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             s_threshold_bin_id = T.alloc_shared([1], T.int32)
             s_histogram = T.alloc_shared([RADIX + 1], T.int32)
             s_num_input = T.alloc_shared([2], T.int32)
-            s_input_idx = T.alloc_shared([2, SMEM_INPUT_SIZE], T.int32)
+            s_input_idx = T.alloc_shared([2, smem_size], T.int32)
 
             l_threshold_bin_id = T.alloc_var(T.int32)
             l_new_topk = T.alloc_var(T.int32)
@@ -271,7 +292,7 @@ def tl_topk_stage3_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
             # of state inherited from stage 2 (besides l_new_topk which we
             # just recomputed from the histogram).
             l_num_input = candidate_count[bx]
-            for s in T.serial(T.ceildiv(SMEM_INPUT_SIZE, BLOCK_SIZE)):
+            for s in T.serial(T.ceildiv(smem_size, BLOCK_SIZE)):
                 pos = s * BLOCK_SIZE + tx
                 if pos < l_num_input:
                     s_input_idx[0, pos] = candidate_idx[bx, pos]
@@ -344,15 +365,16 @@ def tl_topk_stage3_impl(topk, in_dtype=T.float32, out_dtype=T.int32):
 
 def tl_topk(input, starts, ends, topk):
     batch, seq_len = input.shape
+    smem_size = _pick_smem_input_size(seq_len)
     indexes = torch.zeros(batch, topk, dtype=torch.int32, device=input.device)
     global_histogram = torch.zeros(batch, RADIX, dtype=torch.int32, device=input.device)
     direct_counter = torch.zeros(batch, RADIX + 1, dtype=torch.int32, device=input.device)
-    candidate_idx = torch.empty(batch, SMEM_INPUT_SIZE, dtype=torch.int32, device=input.device)
+    candidate_idx = torch.empty(batch, smem_size, dtype=torch.int32, device=input.device)
     candidate_count = torch.zeros(batch, dtype=torch.int32, device=input.device)
 
     stage1 = tl_topk_stage1_impl()
-    stage2 = tl_topk_stage2_impl(topk)
-    stage3 = tl_topk_stage3_impl(topk)
+    stage2 = tl_topk_stage2_impl(topk, smem_size)
+    stage3 = tl_topk_stage3_impl(topk, smem_size)
 
     stage1(input, starts, ends, global_histogram)
     stage2(input, starts, ends, indexes, global_histogram, direct_counter, candidate_idx, candidate_count)
@@ -414,4 +436,7 @@ def run_regression_perf(batch=64, seq_len=32 * 1024, topk=2048):
 
 
 if __name__ == "__main__":
-    test_topk_selector()
+    shapes = [(8192, 256), (32768, 1024), (131072, 2048), (262144, 2048)]
+    for seq_len, topk in shapes:
+        print(f"\n===== (seq_len={seq_len}, topk={topk}) =====")
+        test_topk_selector(batch=1, seq_len=seq_len, topk=topk)
