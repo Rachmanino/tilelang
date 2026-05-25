@@ -26,10 +26,7 @@ public:
 
   static void RegisterReflection() {
     namespace refl = tvm::ffi::reflection;
-    refl::ObjectDef<GemmSPWarpPolicyNode>()
-        .def_ro("policy_type", &GemmSPWarpPolicyNode::policy_type)
-        .def_ro("m_warp", &GemmSPWarpPolicyNode::m_warp)
-        .def_ro("n_warp", &GemmSPWarpPolicyNode::n_warp);
+    refl::ObjectDef<GemmSPWarpPolicyNode>();
   }
 };
 
